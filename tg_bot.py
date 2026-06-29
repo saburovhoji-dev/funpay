@@ -3,6 +3,7 @@ tg_bot.py — Telegram-бот управления на aiogram 3.x с FSM и к
 """
 
 import logging
+import asyncio
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
@@ -19,8 +20,6 @@ from funpay_client import FunPayClient
 
 logger = logging.getLogger(__name__)
 
-# ─── FSM-состояния ────────────────────────────────────────────────────────────
-
 class SetKeyState(StatesGroup):
     waiting_for_key = State()
 
@@ -35,7 +34,6 @@ class SetProxyState(StatesGroup):
 class DeleteProductState(StatesGroup):
     waiting_for_funpay_id = State()
 
-# ─── Клавиатуры ───────────────────────────────────────────────────────────────
 
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -70,18 +68,15 @@ def cancel_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
     )
 
-# ─── Роутер ───────────────────────────────────────────────────────────────────
 
 router = Router()
 
-# ─── Команды ──────────────────────────────────────────────────────────────────
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "👋 Добро пожаловать в FunPay Bot!\n\n"
-        "Выберите действие в меню ниже.",
+        "👋 Добро пожаловать в FunPay Bot!\n\nВыберите действие в меню ниже.",
         reply_markup=main_keyboard(),
     )
 
@@ -91,7 +86,6 @@ async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Действие отменено.", reply_markup=main_keyboard())
 
-# ─── Статус ───────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📋 Статус")
 async def show_status(message: Message):
@@ -99,14 +93,10 @@ async def show_status(message: Message):
     golden_key = config.get("golden_key", "")
     proxy = config.get("proxy") or "не задан"
     auto_lift = "✅ Включено" if config.get("auto_lift_enabled") else "❌ Выключено"
+    db_path = db.DB_PATH
 
     if golden_key:
-        client = FunPayClient(golden_key, config.get("proxy"))
-        try:
-            username = await client.validate_golden_key()
-        finally:
-            await client.close()
-        key_status = f"✅ Валиден (пользователь: <b>{username or 'неизвестно'}</b>)" if username else "❌ Недействителен"
+        key_status = f"✅ Задан (<code>{golden_key[:8]}...</code>)"
     else:
         key_status = "⚠️ Не задан"
 
@@ -117,12 +107,12 @@ async def show_status(message: Message):
         f"🔑 Golden Key: {key_status}\n"
         f"🌐 Прокси: <code>{proxy}</code>\n"
         f"⬆️ Автоподнятие: {auto_lift}\n"
-        f"📦 Товаров в базе: <b>{len(products)}</b>",
+        f"📦 Товаров в базе: <b>{len(products)}</b>\n"
+        f"💾 БД: <code>{db_path}</code>",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
 
-# ─── Golden Key ───────────────────────────────────────────────────────────────
 
 @router.message(F.text == "🔑 Установить golden_key")
 async def ask_golden_key(message: Message, state: FSMContext):
@@ -141,28 +131,46 @@ async def receive_golden_key(message: Message, state: FSMContext):
         await message.answer("⚠️ Слишком короткий ключ. Попробуйте ещё раз.")
         return
 
-    await message.answer("⏳ Проверяю ключ на FunPay...")
-    client = FunPayClient(key)
+    # Сохраняем ключ сразу, без проверки на FunPay
+    await db.set_golden_key(key)
+    await state.clear()
+
+    config = await db.get_config()
+    proxy = config.get("proxy")
+
+    await message.answer(
+        f"✅ Ключ сохранён: <code>{key[:8]}...</code>\n\n"
+        f"⏳ Проверяю соединение с FunPay...",
+        parse_mode="HTML",
+        reply_markup=main_keyboard(),
+    )
+
+    # Проверяем в фоне с таймаутом
     try:
-        username = await client.validate_golden_key()
-    finally:
-        await client.close()
+        client = FunPayClient(key, proxy)
+        try:
+            username = await asyncio.wait_for(client.validate_golden_key(), timeout=15.0)
+        finally:
+            await client.close()
 
-    if username:
-        await db.set_golden_key(key)
-        await state.clear()
+        if username:
+            await message.answer(
+                f"✅ FunPay отвечает! Авторизован как <b>{username}</b>.",
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer(
+                "⚠️ Ключ сохранён, но FunPay вернул неожиданный ответ.\n"
+                "Возможно ключ устарел или нужен прокси.",
+            )
+    except asyncio.TimeoutError:
         await message.answer(
-            f"✅ Ключ валиден! Вы авторизованы как <b>{username}</b>.",
-            parse_mode="HTML",
-            reply_markup=main_keyboard(),
+            "⚠️ Ключ сохранён, но FunPay не ответил за 15 секунд.\n"
+            "Попробуйте установить прокси через 🌐 Прокси.",
         )
-    else:
-        await message.answer(
-            "❌ Ключ недействителен или FunPay недоступен. Проверьте и попробуйте снова.",
-            reply_markup=cancel_keyboard(),
-        )
+    except Exception as e:
+        await message.answer(f"⚠️ Ключ сохранён. Ошибка проверки: {e}")
 
-# ─── Прокси ───────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "🌐 Прокси")
 async def ask_proxy(message: Message, state: FSMContext):
@@ -191,15 +199,13 @@ async def receive_proxy(message: Message, state: FSMContext):
     else:
         await message.answer("⚠️ Неверный формат. Используйте http://user:pass@host:port или 'clear'.")
 
-# ─── Автоподнятие ─────────────────────────────────────────────────────────────
 
 @router.message(F.text == "⬆️ Автоподнятие")
 async def show_autolift(message: Message):
     config = await db.get_config()
     enabled = bool(config.get("auto_lift_enabled"))
     await message.answer(
-        "⬆️ <b>Управление автоподнятием лотов</b>\n\n"
-        "Лоты поднимаются каждые 2 часа автоматически.",
+        "⬆️ <b>Управление автоподнятием лотов</b>\n\nЛоты поднимаются каждые 2 часа.",
         parse_mode="HTML",
         reply_markup=autolift_keyboard(enabled),
     )
@@ -218,14 +224,11 @@ async def toggle_autolift(callback: CallbackQuery):
 async def noop_callback(callback: CallbackQuery):
     await callback.answer()
 
-# ─── Товары ───────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📦 Товары")
 async def show_products_menu(message: Message):
     await message.answer(
-        "📦 <b>Управление товарами</b>\n\n"
-        "Каждый товар привязан к его ID на FunPay. "
-        "При оплате заказа покупателю автоматически отправляется текст выдачи.",
+        "📦 <b>Управление товарами</b>",
         parse_mode="HTML",
         reply_markup=products_keyboard(),
     )
@@ -236,26 +239,18 @@ async def list_products(callback: CallbackQuery):
     if not products:
         await callback.answer("Товаров пока нет.", show_alert=True)
         return
-
     lines = []
     for p in products:
         preview = p["response_text"][:40] + ("..." if len(p["response_text"]) > 40 else "")
-        lines.append(
-            f"🆔 <code>{p['funpay_id']}</code> | {p['category']}\n"
-            f"   📝 {preview}"
-        )
-
-    text = "<b>📦 Список товаров:</b>\n\n" + "\n\n".join(lines)
-    await callback.message.answer(text, parse_mode="HTML")
+        lines.append(f"🆔 <code>{p['funpay_id']}</code> | {p['category']}\n   📝 {preview}")
+    await callback.message.answer("<b>📦 Список товаров:</b>\n\n" + "\n\n".join(lines), parse_mode="HTML")
     await callback.answer()
 
 @router.callback_query(F.data == "product_add")
 async def start_add_product(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AddProductState.waiting_for_funpay_id)
     await callback.message.answer(
-        "📦 <b>Добавление товара</b>\n\n"
-        "Шаг 1/3: Введите <b>FunPay ID</b> вашего лота (число из URL лота).\n"
-        "Пример: <code>123456</code>",
+        "📦 Шаг 1/3: Введите <b>FunPay ID</b> лота (число из URL).",
         parse_mode="HTML",
         reply_markup=cancel_keyboard(),
     )
@@ -265,14 +260,11 @@ async def start_add_product(callback: CallbackQuery, state: FSMContext):
 async def receive_product_id(message: Message, state: FSMContext):
     text = message.text.strip() if message.text else ""
     if not text.isdigit():
-        await message.answer("⚠️ ID должен содержать только цифры. Попробуйте ещё раз.")
+        await message.answer("⚠️ ID должен содержать только цифры.")
         return
     await state.update_data(funpay_id=text)
     await state.set_state(AddProductState.waiting_for_category)
-    await message.answer(
-        "Шаг 2/3: Введите <b>название категории</b> товара (например: <i>Аккаунты Steam</i>).",
-        parse_mode="HTML",
-    )
+    await message.answer("Шаг 2/3: Введите <b>название категории</b>.", parse_mode="HTML")
 
 @router.message(AddProductState.waiting_for_category)
 async def receive_product_category(message: Message, state: FSMContext):
@@ -282,11 +274,7 @@ async def receive_product_category(message: Message, state: FSMContext):
         return
     await state.update_data(category=category)
     await state.set_state(AddProductState.waiting_for_response_text)
-    await message.answer(
-        "Шаг 3/3: Введите <b>текст автовыдачи</b>, который будет отправлен покупателю.\n\n"
-        "Поддерживаются переносы строк. Пишите так, как должен выглядеть финальный текст.",
-        parse_mode="HTML",
-    )
+    await message.answer("Шаг 3/3: Введите <b>текст автовыдачи</b>.", parse_mode="HTML")
 
 @router.message(AddProductState.waiting_for_response_text)
 async def receive_product_response(message: Message, state: FSMContext):
@@ -294,16 +282,11 @@ async def receive_product_response(message: Message, state: FSMContext):
     if not response_text:
         await message.answer("⚠️ Текст выдачи не может быть пустым.")
         return
-
     data = await state.get_data()
-    funpay_id = data["funpay_id"]
-    category = data["category"]
-
-    await db.add_or_update_product(funpay_id, category, response_text)
+    await db.add_or_update_product(data["funpay_id"], data["category"], response_text)
     await state.clear()
     await message.answer(
-        f"✅ Товар <code>{funpay_id}</code> ({category}) успешно сохранён!\n\n"
-        f"📝 Текст выдачи:\n<i>{response_text[:200]}</i>",
+        f"✅ Товар <code>{data['funpay_id']}</code> сохранён!",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
@@ -311,11 +294,7 @@ async def receive_product_response(message: Message, state: FSMContext):
 @router.callback_query(F.data == "product_delete")
 async def start_delete_product(callback: CallbackQuery, state: FSMContext):
     await state.set_state(DeleteProductState.waiting_for_funpay_id)
-    await callback.message.answer(
-        "🗑 Введите <b>FunPay ID</b> товара, который нужно удалить:",
-        parse_mode="HTML",
-        reply_markup=cancel_keyboard(),
-    )
+    await callback.message.answer("🗑 Введите <b>FunPay ID</b> товара для удаления:", parse_mode="HTML", reply_markup=cancel_keyboard())
     await callback.answer()
 
 @router.message(DeleteProductState.waiting_for_funpay_id)
@@ -331,40 +310,31 @@ async def receive_delete_id(message: Message, state: FSMContext):
     else:
         await message.answer(f"⚠️ Товар с ID <code>{text}</code> не найден.", parse_mode="HTML", reply_markup=main_keyboard())
 
-# ─── Заказы ───────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📊 Заказы")
 async def show_orders_info(message: Message):
     config = await db.get_config()
     golden_key = config.get("golden_key", "")
     if not golden_key:
-        await message.answer("⚠️ Golden Key не задан. Установите его сначала.")
+        await message.answer("⚠️ Golden Key не задан.")
         return
-
-    await message.answer("⏳ Запрашиваю актуальные заказы с FunPay...")
+    await message.answer("⏳ Запрашиваю заказы с FunPay...")
     client = FunPayClient(golden_key, config.get("proxy"))
     try:
-        orders = await client.get_paid_orders()
+        orders = await asyncio.wait_for(client.get_paid_orders(), timeout=15.0)
+    except asyncio.TimeoutError:
+        await message.answer("⚠️ FunPay не ответил за 15 секунд.")
+        return
     finally:
         await client.close()
-
     if not orders:
         await message.answer("📭 Оплаченных заказов не найдено.")
         return
-
     lines = []
-    for o in orders[:10]:  # показываем последние 10
-        lines.append(
-            f"📦 Заказ <code>{o.order_id}</code>\n"
-            f"   👤 Покупатель: <b>{o.buyer_username}</b>\n"
-            f"   🎁 Товар ID: <code>{o.product_funpay_id or 'N/A'}</code>"
-        )
-    await message.answer(
-        f"<b>📊 Последние оплаченные заказы ({len(orders)}):</b>\n\n" + "\n\n".join(lines),
-        parse_mode="HTML",
-    )
+    for o in orders[:10]:
+        lines.append(f"📦 <code>{o.order_id}</code> | 👤 <b>{o.buyer_username}</b>")
+    await message.answer("<b>📊 Последние заказы:</b>\n\n" + "\n".join(lines), parse_mode="HTML")
 
-# ─── Навигация ────────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "back_main")
 async def back_to_main(callback: CallbackQuery, state: FSMContext):
@@ -372,7 +342,6 @@ async def back_to_main(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("Главное меню:", reply_markup=main_keyboard())
     await callback.answer()
 
-# ─── Фабрика бота ─────────────────────────────────────────────────────────────
 
 def create_bot_and_dispatcher(token: str) -> tuple[Bot, Dispatcher]:
     bot = Bot(token=token)
