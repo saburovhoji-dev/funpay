@@ -1,20 +1,47 @@
 """
 database.py — Работа с локальной SQLite-базой данных через aiosqlite.
-Путь к БД берётся из переменной окружения DB_PATH (Railway Volume).
+Автоматически находит путь к Volume на Railway.
 """
 
 import os
+import glob
 import aiosqlite
 from typing import Optional
 
-# Railway Volume монтируется в /data — задайте этот путь в Variables
-# Локально по умолчанию создаётся рядом со скриптом
-DB_PATH = os.environ.get("DB_PATH", "/data/funpay_bot.db")
+
+def _find_db_path() -> str:
+    """
+    Автоматически находит путь к Volume на Railway.
+    Если Volume не найден — использует текущую директорию.
+    """
+    # Сначала проверяем явно заданный путь
+    explicit = os.environ.get("DB_PATH", "")
+    if explicit and explicit != "/data/funpay_bot.db":
+        return explicit
+
+    # Ищем Railway Volume по известному паттерну
+    patterns = [
+        "/var/lib/containers/railwayapp/bind-mounts/*/vol_*/",
+        "/data/",
+        "/mnt/",
+    ]
+    for pattern in patterns:
+        matches = glob.glob(pattern)
+        if matches:
+            return os.path.join(matches[0], "funpay_bot.db")
+
+    # Fallback — рядом со скриптом
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "funpay_bot.db")
+
+
+DB_PATH = _find_db_path()
 
 
 async def init_db() -> None:
     """Создаёт все необходимые таблицы при первом запуске."""
-    # Убеждаемся, что директория существует (важно для Railway Volume)
+    import logging
+    logging.getLogger(__name__).info(f"Используется БД: {DB_PATH}")
+
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
@@ -50,8 +77,6 @@ async def init_db() -> None:
         await db.commit()
 
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
-
 async def get_config() -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -82,8 +107,6 @@ async def set_auto_lift(enabled: bool) -> None:
         )
         await db.commit()
 
-
-# ─── PRODUCTS ─────────────────────────────────────────────────────────────────
 
 async def add_or_update_product(funpay_id: str, category: str, response_text: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -123,8 +146,6 @@ async def delete_product(funpay_id: str) -> bool:
         await db.commit()
         return cursor.rowcount > 0
 
-
-# ─── ORDERS ───────────────────────────────────────────────────────────────────
 
 async def is_order_known(order_id: str) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
