@@ -80,7 +80,7 @@ class FunPayClient:
             self._client = httpx.AsyncClient(
                 headers=HEADERS_BASE,
                 cookies=cookies,
-                proxies=self.proxy,
+                proxy=self.proxy,
                 follow_redirects=True,
                 timeout=httpx.Timeout(20.0),
             )
