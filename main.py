@@ -1,6 +1,5 @@
 """
-main.py — Точка входа. Запуск Telegram-бота и двух фоновых asyncio-задач.
-Токены читаются из переменных окружения (Railway Environment Variables).
+main.py — Точка входа. Запуск бота и трёх фоновых задач.
 """
 
 import asyncio
@@ -14,24 +13,19 @@ import database as db
 from funpay_client import FunPayClient
 from tg_bot import create_bot_and_dispatcher
 
-# ─── Настройки из переменных окружения ────────────────────────────────────────
-
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 OWNER_TELEGRAM_ID  = int(os.environ.get("OWNER_TELEGRAM_ID", "0"))
 
 if not TELEGRAM_BOT_TOKEN:
-    print("ОШИБКА: переменная окружения TELEGRAM_BOT_TOKEN не задана.", file=sys.stderr)
+    print("ОШИБКА: TELEGRAM_BOT_TOKEN не задан.", file=sys.stderr)
     sys.exit(1)
-
 if not OWNER_TELEGRAM_ID:
-    print("ОШИБКА: переменная окружения OWNER_TELEGRAM_ID не задана.", file=sys.stderr)
+    print("ОШИБКА: OWNER_TELEGRAM_ID не задан.", file=sys.stderr)
     sys.exit(1)
 
-# Интервалы
 ORDER_CHECK_INTERVAL_SEC = int(os.environ.get("ORDER_CHECK_INTERVAL_SEC", "10"))
 LIFT_INTERVAL_SEC        = int(os.environ.get("LIFT_INTERVAL_SEC", str(2 * 60 * 60)))
-
-# ─── Логирование ──────────────────────────────────────────────────────────────
+AUTORESPONSE_INTERVAL_SEC = 15
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,23 +36,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ─── Фоновая задача 1: Мониторинг заказов ─────────────────────────────────────
-
 async def orders_monitor_loop(bot: Bot) -> None:
     logger.info("Запущен мониторинг заказов.")
     while True:
         try:
             config = await db.get_config()
             golden_key = config.get("golden_key", "")
-
             if not golden_key:
-                logger.warning("Мониторинг: golden_key не задан, жду следующей итерации.")
                 await asyncio.sleep(ORDER_CHECK_INTERVAL_SEC)
                 continue
 
             client = FunPayClient(golden_key, config.get("proxy"))
             try:
-                paid_orders = await client.get_paid_orders()
+                paid_orders = await asyncio.wait_for(client.get_paid_orders(), timeout=20.0)
             finally:
                 await client.close()
 
@@ -66,7 +56,7 @@ async def orders_monitor_loop(bot: Bot) -> None:
                 if await db.is_order_known(order.order_id):
                     continue
 
-                logger.info(f"Новый заказ: {order.order_id} | покупатель: {order.buyer_username}")
+                logger.info(f"Новый заказ: {order.order_id} | {order.buyer_username}")
 
                 product = None
                 if order.product_funpay_id:
@@ -75,69 +65,71 @@ async def orders_monitor_loop(bot: Bot) -> None:
                 if product:
                     send_client = FunPayClient(golden_key, config.get("proxy"))
                     try:
-                        sent = await send_client.send_message(
-                            chat_id=order.chat_id,
-                            text=product["response_text"],
+                        sent = await asyncio.wait_for(
+                            send_client.send_message(order.chat_id, product["response_text"]),
+                            timeout=15.0
                         )
                     finally:
                         await send_client.close()
 
                     if sent:
                         await db.add_order(order.order_id, "delivered")
+                        await db.increment_stat("deliveries")
+                        await db.add_log("success", f"Выдан заказ {order.order_id} → {order.buyer_username}")
                         await bot.send_message(
                             chat_id=OWNER_TELEGRAM_ID,
                             text=(
-                                f"✅ <b>Заказ выполнен автоматически</b>\n\n"
+                                f"✅ <b>Заказ выполнен!</b>\n\n"
                                 f"📦 Заказ: <code>{order.order_id}</code>\n"
                                 f"👤 Покупатель: <b>{order.buyer_username}</b>\n"
                                 f"🎁 Товар ID: <code>{order.product_funpay_id}</code>\n\n"
-                                f"📨 Текст выдачи отправлен в чат FunPay."
+                                f"📨 Текст выдачи отправлен автоматически."
                             ),
                             parse_mode="HTML",
                         )
                     else:
                         await db.add_order(order.order_id, "send_failed")
+                        await db.add_log("error", f"Ошибка отправки для заказа {order.order_id}")
                         await bot.send_message(
                             chat_id=OWNER_TELEGRAM_ID,
                             text=(
-                                f"⚠️ <b>Ошибка автовыдачи</b>\n\n"
+                                f"❌ <b>Ошибка автовыдачи</b>\n\n"
                                 f"📦 Заказ: <code>{order.order_id}</code>\n"
                                 f"👤 Покупатель: <b>{order.buyer_username}</b>\n\n"
-                                f"❌ Не удалось отправить сообщение. Проверьте вручную."
+                                f"Не удалось отправить сообщение. Проверьте вручную."
                             ),
                             parse_mode="HTML",
                         )
                 else:
                     await db.add_order(order.order_id, "no_product")
+                    await db.add_log("warning", f"Заказ {order.order_id} — товар не найден в базе")
                     await bot.send_message(
                         chat_id=OWNER_TELEGRAM_ID,
                         text=(
-                            f"🔔 <b>Новый заказ — требует внимания</b>\n\n"
+                            f"🔔 <b>Новый заказ — нужна выдача вручную</b>\n\n"
                             f"📦 Заказ: <code>{order.order_id}</code>\n"
                             f"👤 Покупатель: <b>{order.buyer_username}</b>\n"
                             f"🎁 Товар ID: <code>{order.product_funpay_id or 'не определён'}</code>\n\n"
-                            f"⚠️ Товар не найден в базе. Выдайте вручную."
+                            f"⚠️ Товар не найден в базе. Добавьте его через 📦 Товары."
                         ),
                         parse_mode="HTML",
                     )
 
         except asyncio.CancelledError:
-            logger.info("Мониторинг заказов остановлен.")
             break
+        except asyncio.TimeoutError:
+            logger.warning("Таймаут при проверке заказов.")
         except Exception as e:
             logger.exception(f"Ошибка в мониторинге заказов: {e}")
 
         await asyncio.sleep(ORDER_CHECK_INTERVAL_SEC)
 
 
-# ─── Фоновая задача 2: Автоподнятие лотов ─────────────────────────────────────
-
 async def auto_lift_loop(bot: Bot) -> None:
-    logger.info("Запущен цикл автоподнятия лотов.")
+    logger.info("Запущен цикл автоподнятия.")
     while True:
         try:
             config = await db.get_config()
-
             if not config.get("auto_lift_enabled"):
                 await asyncio.sleep(ORDER_CHECK_INTERVAL_SEC)
                 continue
@@ -147,31 +139,23 @@ async def auto_lift_loop(bot: Bot) -> None:
                 await asyncio.sleep(LIFT_INTERVAL_SEC)
                 continue
 
-            logger.info("Начинаю поднятие лотов...")
             client = FunPayClient(golden_key, config.get("proxy"))
             try:
-                success = await client.raise_lots()
+                success = await asyncio.wait_for(client.raise_lots(), timeout=30.0)
             finally:
                 await client.close()
 
             if success:
+                await db.add_log("success", "Лоты подняты автоматически")
                 await bot.send_message(
                     chat_id=OWNER_TELEGRAM_ID,
-                    text="⬆️ <b>Лоты подняты</b>\n\nАвтоподнятие выполнено успешно.",
+                    text="⬆️ <b>Лоты подняты!</b>\n\nАвтоподнятие выполнено успешно.",
                     parse_mode="HTML",
                 )
             else:
-                await bot.send_message(
-                    chat_id=OWNER_TELEGRAM_ID,
-                    text=(
-                        "⚠️ <b>Автоподнятие</b>\n\n"
-                        "Не удалось поднять лоты или нет активных лотов."
-                    ),
-                    parse_mode="HTML",
-                )
+                await db.add_log("warning", "Автоподнятие: нет активных лотов или ошибка")
 
         except asyncio.CancelledError:
-            logger.info("Цикл автоподнятия остановлен.")
             break
         except Exception as e:
             logger.exception(f"Ошибка в автоподнятии: {e}")
@@ -179,24 +163,84 @@ async def auto_lift_loop(bot: Bot) -> None:
         await asyncio.sleep(LIFT_INTERVAL_SEC)
 
 
-# ─── Запуск ───────────────────────────────────────────────────────────────────
+async def autoresponse_loop(bot: Bot) -> None:
+    logger.info("Запущен автоответчик.")
+    while True:
+        try:
+            config = await db.get_config()
+            golden_key = config.get("golden_key", "")
+            autoresponse_text = await db.get_autoresponse()
+
+            if not golden_key or not autoresponse_text:
+                await asyncio.sleep(AUTORESPONSE_INTERVAL_SEC)
+                continue
+
+            client = FunPayClient(golden_key, config.get("proxy"))
+            try:
+                chats = await asyncio.wait_for(client.get_chats(), timeout=15.0)
+            finally:
+                await client.close()
+
+            for chat in chats:
+                if not chat.unread:
+                    continue
+                if await db.is_chat_responded(chat.chat_id):
+                    continue
+
+                send_client = FunPayClient(golden_key, config.get("proxy"))
+                try:
+                    sent = await asyncio.wait_for(
+                        send_client.send_message(chat.chat_id, autoresponse_text),
+                        timeout=10.0
+                    )
+                finally:
+                    await send_client.close()
+
+                if sent:
+                    await db.mark_chat_responded(chat.chat_id)
+                    await db.increment_stat("autoresponses")
+                    await db.add_log("info", f"Автоответ → {chat.username}")
+                    await bot.send_message(
+                        chat_id=OWNER_TELEGRAM_ID,
+                        text=(
+                            f"💬 <b>Автоответ отправлен</b>\n\n"
+                            f"👤 {chat.username}"
+                        ),
+                        parse_mode="HTML",
+                    )
+
+        except asyncio.CancelledError:
+            break
+        except asyncio.TimeoutError:
+            pass
+        except Exception as e:
+            logger.exception(f"Ошибка в автоответчике: {e}")
+
+        await asyncio.sleep(AUTORESPONSE_INTERVAL_SEC)
+
 
 async def main() -> None:
     await db.init_db()
-    logger.info("База данных инициализирована.")
+    logger.info("БД инициализирована.")
 
     bot, dp = create_bot_and_dispatcher(TELEGRAM_BOT_TOKEN)
 
-    order_task = asyncio.create_task(orders_monitor_loop(bot))
-    lift_task  = asyncio.create_task(auto_lift_loop(bot))
+    from tg_bot import set_bot_commands
+    await set_bot_commands(bot)
+
+    order_task        = asyncio.create_task(orders_monitor_loop(bot))
+    lift_task         = asyncio.create_task(auto_lift_loop(bot))
+    autoresponse_task = asyncio.create_task(autoresponse_loop(bot))
 
     try:
         try:
             await bot.send_message(
                 chat_id=OWNER_TELEGRAM_ID,
                 text=(
-                    "🚀 <b>FunPay Bot запущен на Railway</b>\n\n"
-                    "Мониторинг заказов и автоподнятие активны.\n"
+                    "🚀 <b>FunPay Bot Pro запущен!</b>\n\n"
+                    "✅ Мониторинг заказов активен\n"
+                    "✅ Автоответчик готов\n"
+                    "✅ Автоподнятие настроено\n\n"
                     "Используйте /start для управления."
                 ),
                 parse_mode="HTML",
@@ -204,13 +248,15 @@ async def main() -> None:
         except Exception as e:
             logger.warning(f"Не удалось отправить стартовое уведомление: {e}")
 
+        await db.add_log("info", "Бот запущен")
         logger.info("Запускаю polling...")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
     finally:
         order_task.cancel()
         lift_task.cancel()
-        await asyncio.gather(order_task, lift_task, return_exceptions=True)
+        autoresponse_task.cancel()
+        await asyncio.gather(order_task, lift_task, autoresponse_task, return_exceptions=True)
         await bot.session.close()
         logger.info("Бот остановлен.")
 
